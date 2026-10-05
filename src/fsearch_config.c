@@ -130,7 +130,7 @@ static const FsearchKeyData INTERFACE_SECTION[] = {
     CONF_STR(sort_by, "Name"),
 };
 
-static const FsearchKeyData CACHE_WINDOW_SECTION[] = {
+static const FsearchKeyData STATE_WINDOW_SECTION[] = {
     CONF_INT(window_width, 850),
     CONF_INT(window_height, 600),
     CONF_INT(name_column_width, 250),
@@ -205,7 +205,7 @@ static const FsearchKeyData EXCLUDE_KEYS[] = {
 };
 
 static const char *config_file_name = "fsearch.conf";
-static const char *cache_file_name = "window.conf";
+static const char *state_file_name = "state.ini";
 static const char *config_folder_name = "fsearch";
 
 void
@@ -224,20 +224,23 @@ config_build_path(char *path, size_t len) {
     snprintf(path, len, "%s/%s/%s", xdg_conf_dir, config_folder_name, config_file_name);
 }
 
-static void
-config_build_cache_dir(char *path, size_t len) {
-    g_assert(path);
-
-    const gchar *xdg_cache_dir = g_get_user_cache_dir();
-    snprintf(path, len, "%s/%s", xdg_cache_dir, config_folder_name);
+static const gchar *
+config_get_state_dir(size_t index) {
+    const gchar *dirs[] = {
+#if GLIB_CHECK_VERSION(2, 72, 0)
+        g_get_user_state_dir(),
+#endif
+        g_get_user_cache_dir(),
+        NULL,
+    };
+    return dirs[index];
 }
 
 static void
-config_build_cache_path(char *path, size_t len) {
+config_build_state_path(char *path, size_t len, const gchar *dir) {
     g_assert(path);
 
-    const gchar *xdg_cache_dir = g_get_user_cache_dir();
-    snprintf(path, len, "%s/%s/%s", xdg_cache_dir, config_folder_name, cache_file_name);
+    snprintf(path, len, "%s/%s/%s", dir, config_folder_name, state_file_name);
 }
 
 bool
@@ -248,10 +251,10 @@ config_make_dir(void) {
 }
 
 static bool
-config_make_cache_dir(void) {
-    gchar cache_dir[PATH_MAX] = "";
-    config_build_cache_dir(cache_dir, sizeof(cache_dir));
-    return !g_mkdir_with_parents(cache_dir, 0700);
+config_make_state_dir(const gchar *dir) {
+    gchar state_dir[PATH_MAX] = "";
+    snprintf(state_dir, sizeof(state_dir), "%s/%s", dir, config_folder_name);
+    return !g_mkdir_with_parents(state_dir, 0700);
 }
 
 static void
@@ -659,18 +662,23 @@ config_load(FsearchConfig *config) {
         CONFIG_LOAD_SECTION(key_file, "Interface", WINDOW_SECTION, config);
 
         // Volatile window and column geometry
-        g_autoptr(GKeyFile) cache_key_file = g_key_file_new();
-        g_assert(cache_key_file);
+        g_autoptr(GKeyFile) state_key_file = g_key_file_new();
+        g_assert(state_key_file);
 
-        gchar cache_path[PATH_MAX] = "";
-        config_build_cache_path(cache_path, sizeof(cache_path));
-
-        g_autoptr(GError) cache_error = NULL;
-        if (g_key_file_load_from_file(cache_key_file, cache_path, G_KEY_FILE_NONE, &cache_error)) {
-            CONFIG_LOAD_SECTION(cache_key_file, "Window", CACHE_WINDOW_SECTION, config);
+        gchar state_path[PATH_MAX] = "";
+        bool state_loaded = false;
+        for (size_t i = 0; config_get_state_dir(i); ++i) {
+            config_build_state_path(state_path, sizeof(state_path), config_get_state_dir(i));
+            if (g_key_file_load_from_file(state_key_file, state_path, G_KEY_FILE_NONE, NULL)) {
+                state_loaded = true;
+                break;
+            }
+        }
+        if (state_loaded) {
+            CONFIG_LOAD_SECTION(state_key_file, "Window", STATE_WINDOW_SECTION, config);
         }
         else {
-            CONFIG_LOAD_SECTION(key_file, "Interface", CACHE_WINDOW_SECTION, config);
+            CONFIG_LOAD_SECTION(key_file, "Interface", STATE_WINDOW_SECTION, config);
         }
 
         // Columns
@@ -724,7 +732,7 @@ config_load_default(FsearchConfig *config) {
 
     CONFIG_DEFAULT_SECTION(INTERFACE_SECTION, config);
     CONFIG_DEFAULT_SECTION(WINDOW_SECTION, config);
-    CONFIG_DEFAULT_SECTION(CACHE_WINDOW_SECTION, config);
+    CONFIG_DEFAULT_SECTION(STATE_WINDOW_SECTION, config);
     CONFIG_DEFAULT_SECTION(DIALOG_SECTION, config);
     CONFIG_DEFAULT_SECTION(APPLICATIONS_SECTION, config);
     CONFIG_DEFAULT_SECTION(SEARCH_SECTION, config);
@@ -849,35 +857,35 @@ config_save(FsearchConfig *config) {
     config_save_excludes(key_file, config->excludes);
 
     // Volatile window and column geometry is persisted to a separate file in the
-    // cache directory so it doesn't pollute the main settings file (#659). If that
-    // write fails (e.g. the cache dir is unwritable), fall back to storing the
-    // geometry in the main config file under "Interface" so it isn't lost; the next
-    // load picks it back up via the legacy migration path.
-    bool cache_saved = false;
-    g_autoptr(GKeyFile) cache_key_file = g_key_file_new();
-    g_assert(cache_key_file);
+    // state directory, with the cache directory as a fallback (#659). If both
+    // writes fail, store the geometry in the main config file under "Interface"
+    // so it isn't lost; the next load picks it back up via the legacy migration path.
+    bool state_saved = false;
+    g_autoptr(GKeyFile) state_key_file = g_key_file_new();
+    g_assert(state_key_file);
 
-    CONFIG_SAVE_SECTION(cache_key_file, "Window", CACHE_WINDOW_SECTION, config);
+    CONFIG_SAVE_SECTION(state_key_file, "Window", STATE_WINDOW_SECTION, config);
 
-    if (config_make_cache_dir()) {
-        gchar cache_path[PATH_MAX] = "";
-        config_build_cache_path(cache_path, sizeof(cache_path));
+    for (size_t i = 0; !state_saved && config_get_state_dir(i); ++i) {
+        const gchar *dir = config_get_state_dir(i);
+        if (config_make_state_dir(dir)) {
+            gchar state_path[PATH_MAX] = "";
+            config_build_state_path(state_path, sizeof(state_path), dir);
 
-        g_autoptr(GError) cache_error = NULL;
-        if (g_key_file_save_to_file(cache_key_file, cache_path, &cache_error)) {
-            cache_saved = true;
+            g_autoptr(GError) state_error = NULL;
+            state_saved = g_key_file_save_to_file(state_key_file, state_path, &state_error);
+            if (!state_saved) {
+                g_debug("[config] saving window state failed: %s", state_error ? state_error->message : "unknown error");
+            }
         }
         else {
-            g_debug("[config] saving window cache failed: %s", cache_error ? cache_error->message : "unknown error");
+            g_debug("[config] creating window state directory failed");
         }
     }
-    else {
-        g_debug("[config] creating window cache directory failed");
-    }
 
-    if (!cache_saved) {
+    if (!state_saved) {
         // Fallback: keep geometry in the main config file so it survives.
-        CONFIG_SAVE_SECTION(key_file, "Interface", CACHE_WINDOW_SECTION, config);
+        CONFIG_SAVE_SECTION(key_file, "Interface", STATE_WINDOW_SECTION, config);
     }
 
     gchar config_path[PATH_MAX] = "";
